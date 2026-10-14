@@ -1,182 +1,52 @@
 require('dotenv').config();
-const {
-  Client,
-  GatewayIntentBits,
-  ActionRowBuilder,
-  ButtonBuilder,
-  ButtonStyle,
-  EmbedBuilder,
-  SnowflakeUtil,
-  PermissionFlagsBits,
-} = require('discord.js');
+const { Client, GatewayIntentBits, EmbedBuilder, PermissionFlagsBits } = require('discord.js');
 const store = require('./store');
+const { runRound } = require('./round');
+const { startDailyScheduler } = require('./daily');
 
 const ROUND_MS = 30_000;
-const MIN_LEN = 20;
-const MAX_LEN = 300;
-const MAX_OPTIONS = 5;
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
 });
 
+// Channels with a round currently running (one at a time per channel).
 const activeChannels = new Set();
 
-const shuffle = (arr) => {
-  const a = [...arr];
-  for (let i = a.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [a[i], a[j]] = [a[j], a[i]];
-  }
-  return a;
-};
-
-const nameOf = (msg) => msg.member?.displayName ?? msg.author.globalName ?? msg.author.username;
-
-function isGood(msg) {
-  if (msg.author.bot || msg.system || !msg.content) return false;
-  const len = msg.content.length;
-  if (len < MIN_LEN || len > MAX_LEN) return false;
-  if (/https?:\/\//i.test(msg.content)) return false;
-  if (msg.mentions.users.size > 0 || msg.mentions.everyone) return false;
-  if (msg.content.startsWith('/') || msg.content.startsWith('!')) return false;
-  return true;
-}
-
-// Samples random points in the channel's history until it finds a good message.
-async function pickRound(channel) {
-  const created = SnowflakeUtil.timestampFrom(channel.id);
-  const pool = new Map(); // authorId -> display name
-  let chosen = null;
-
-  for (let attempt = 0; attempt < 10; attempt++) {
-    const ts = created + Math.floor(Math.random() * (Date.now() - created));
-    const before = SnowflakeUtil.generate({ timestamp: ts }).toString();
-    const batch = await channel.messages.fetch({ limit: 100, before });
-    if (batch.size === 0) continue;
-
-    for (const m of batch.values()) {
-      if (!m.author.bot && !m.system) pool.set(m.author.id, nameOf(m));
-    }
-
-    if (!chosen) {
-      const good = [...batch.values()].filter(isGood);
-      if (good.length) chosen = good[Math.floor(Math.random() * good.length)];
-    }
-    if (chosen && pool.size >= 3) break;
-  }
-
-  if (!chosen || pool.size < 3) return null;
-
-  pool.set(chosen.author.id, nameOf(chosen));
-  const others = shuffle([...pool.entries()].filter(([id]) => id !== chosen.author.id)).slice(0, MAX_OPTIONS - 1);
-  const options = shuffle([[chosen.author.id, nameOf(chosen)], ...others]).map(([id, name]) => ({ id, name }));
-  return { message: chosen, options };
-}
-
-function buttonsFor(options, disabled = false, correctId = null) {
-  const row = new ActionRowBuilder();
-  for (const o of options) {
-    const btn = new ButtonBuilder()
-      .setCustomId(`guess:${o.id}`)
-      .setLabel(o.name.slice(0, 80))
-      .setDisabled(disabled)
-      .setStyle(correctId ? (o.id === correctId ? ButtonStyle.Success : ButtonStyle.Secondary) : ButtonStyle.Primary);
-    row.addComponents(btn);
-  }
-  return row;
-}
-
 async function play(interaction) {
-  const channel = interaction.options.getChannel('channel') ?? interaction.channel;
+  // No channel given = pull from every channel in the server the bot can read.
+  const onlyChannel = interaction.options.getChannel('channel');
   const me = interaction.guild.members.me;
 
-  if (!channel.permissionsFor(me)?.has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory])) {
-    return interaction.reply({ content: `I can't read history in ${channel}. Give me View Channel + Read Message History there.`, ephemeral: true });
+  if (
+    onlyChannel &&
+    !onlyChannel.permissionsFor(me)?.has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory])
+  ) {
+    return interaction.reply({ content: `I can't read history in ${onlyChannel}. Give me View Channel + Read Message History there.`, ephemeral: true });
   }
   if (activeChannels.has(interaction.channelId)) {
     return interaction.reply({ content: 'A round is already running here. Finish that one first.', ephemeral: true });
   }
 
-  activeChannels.add(interaction.channelId);
-  await interaction.deferReply();
+  const lockId = interaction.channelId;
+  const release = () => activeChannels.delete(lockId);
+  activeChannels.add(lockId);
 
   try {
-    const round = await pickRound(channel);
-    if (!round) {
-      return interaction.editReply('Couldn\'t find a good message with enough different people. Try a busier channel.');
-    }
-
-    const { message: target, options } = round;
-    const endsAt = Math.floor((Date.now() + ROUND_MS) / 1000);
-    const embed = new EmbedBuilder()
-      .setTitle('Who said it?')
-      .setDescription(`>>> ${target.content}`)
-      .setFooter({ text: 'One guess each. The author sits this one out.' })
-      .addFields({ name: 'Time is up', value: `<t:${endsAt}:R>` });
-
-    const sent = await interaction.editReply({
-      embeds: [embed],
-      components: [buttonsFor(options)],
-      allowedMentions: { parse: [] },
+    await interaction.deferReply();
+    const result = await runRound({
+      guild: interaction.guild,
+      onlyChannel,
+      roundMs: ROUND_MS,
+      send: (payload) => interaction.editReply(payload),
+      edit: (payload) => interaction.editReply(payload),
+      release,
     });
-
-    const guesses = new Map(); // userId -> guessed authorId
-    const collector = sent.createMessageComponentCollector({ time: ROUND_MS });
-
-    collector.on('collect', async (i) => {
-      if (i.user.id === target.author.id) {
-        return i.reply({ content: 'You wrote this one. Sit this round out and let them squirm.', ephemeral: true });
-      }
-      if (guesses.has(i.user.id)) {
-        return i.reply({ content: 'You already locked in a guess.', ephemeral: true });
-      }
-      guesses.set(i.user.id, i.customId.split(':')[1]);
-      return i.reply({ content: 'Locked in. No take-backs.', ephemeral: true });
-    });
-
-    collector.on('end', async () => {
-      try {
-        const correctId = target.author.id;
-        const winners = [];
-        const losers = [];
-        let first = true;
-        for (const [userId, guess] of guesses) {
-          if (guess === correctId) {
-            const pts = first ? 2 : 1; // first correct guess gets a bonus point
-            first = false;
-            store.record(interaction.guildId, userId, true, pts);
-            winners.push(`<@${userId}> (+${pts})`);
-          } else {
-            store.record(interaction.guildId, userId, false, 0);
-            losers.push(`<@${userId}>`);
-          }
-        }
-
-        const reveal = new EmbedBuilder()
-          .setTitle('Who said it?')
-          .setDescription(`>>> ${target.content}`)
-          .addFields(
-            { name: 'Answer', value: `<@${correctId}> in ${target.channel}, <t:${Math.floor(target.createdTimestamp / 1000)}:D>\n[Jump to message](${target.url})` },
-            { name: 'Got it', value: winners.join('\n') || 'Nobody. Embarrassing.', inline: true },
-            { name: 'Missed', value: losers.join('\n') || 'No misses', inline: true }
-          );
-
-        await interaction.editReply({
-          embeds: [reveal],
-          components: [buttonsFor(options, true, correctId)],
-          allowedMentions: { parse: [] },
-        });
-      } catch (err) {
-        console.error('Failed to reveal round:', err);
-      } finally {
-        activeChannels.delete(interaction.channelId);
-      }
-    });
+    if (result.error) await interaction.editReply(result.message);
   } catch (err) {
-    activeChannels.delete(interaction.channelId);
+    release();
     console.error(err);
-    await interaction.editReply('Something broke while picking a message. Check my permissions and try again.');
+    await interaction.editReply('Something broke while picking a message. Check my permissions and try again.').catch(() => {});
   }
 }
 
@@ -211,6 +81,66 @@ async function stats(interaction) {
   return interaction.reply({ embeds: [embed] });
 }
 
+// ---- Daily automated round ----
+// Set DAILY_CHANNEL_ID to turn it on. Optional: DAILY_TIME (default 15:00),
+// TIMEZONE (default America/New_York), DAILY_ROUND_MINUTES (default 60), DAILY_RUN_ON_START=true (testing).
+async function postDaily() {
+  const channelId = process.env.DAILY_CHANNEL_ID;
+  const channel = await client.channels.fetch(channelId);
+  if (!channel || !channel.isTextBased() || !channel.guild) {
+    throw new Error(`DAILY_CHANNEL_ID ${channelId} isn't a server text channel I can see.`);
+  }
+  if (activeChannels.has(channel.id)) {
+    console.log('[daily] skipped, a round is already running in that channel');
+    return;
+  }
+
+  const minutes = Number(process.env.DAILY_ROUND_MINUTES) || 60;
+  const lockId = channel.id;
+  const release = () => activeChannels.delete(lockId);
+  activeChannels.add(lockId);
+
+  let posted;
+  const result = await runRound({
+    guild: channel.guild,
+    onlyChannel: null,
+    roundMs: minutes * 60_000,
+    header: `☀️ **Daily Who Said It!** You have ${minutes} minutes to guess.`,
+    send: async (payload) => (posted = await channel.send(payload)),
+    edit: (payload) => posted.edit(payload),
+    release,
+  });
+  if (result.error) console.log(`[daily] couldn't start a round: ${result.error}`);
+  else console.log('[daily] round posted');
+}
+
+function startDaily() {
+  if (!process.env.DAILY_CHANNEL_ID) {
+    console.log('Daily round is off. Set DAILY_CHANNEL_ID to turn it on.');
+    return;
+  }
+  const timezone = process.env.TIMEZONE || 'America/New_York';
+  const time = process.env.DAILY_TIME || '15:00';
+
+  try {
+    startDailyScheduler({
+      timezone,
+      time,
+      lastDate: store.getMeta('lastDaily'),
+      markFired: (date) => store.setMeta('lastDaily', date),
+      onFire: postDaily,
+    });
+    console.log(`Daily round scheduled for ${time} ${timezone}.`);
+  } catch (err) {
+    console.error('Could not start the daily round:', err.message);
+    return;
+  }
+
+  if (String(process.env.DAILY_RUN_ON_START).toLowerCase() === 'true') {
+    postDaily().catch((err) => console.error('Daily test failed:', err));
+  }
+}
+
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand() || interaction.commandName !== 'whosaidit') return;
   if (!interaction.inGuild()) {
@@ -226,7 +156,10 @@ client.on('interactionCreate', async (interaction) => {
   }
 });
 
-client.once('clientReady', (c) => console.log(`Logged in as ${c.user.tag}`));
+client.once('clientReady', (c) => {
+  console.log(`Logged in as ${c.user.tag}`);
+  startDaily();
+});
 
 if (!process.env.DISCORD_TOKEN) {
   console.error('Missing DISCORD_TOKEN in .env');

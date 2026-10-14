@@ -1,22 +1,29 @@
 const fs = require('fs');
 const path = require('path');
 
-const FILE = path.join(__dirname, '..', 'data', 'scores.json');
-let data = {};
+const DATA_DIR = path.join(__dirname, '..', 'data');
+const FILE = path.join(DATA_DIR, 'scores.json');
+const SEEN_FILE = path.join(DATA_DIR, 'seen.json');
+const META_FILE = path.join(DATA_DIR, 'meta.json');
+const SEEN_MAX = 500; // remember the last 500 used messages per server
 
-function load() {
+let data = {};
+let seen = {};
+let meta = {};
+
+function readJson(file) {
   try {
-    data = JSON.parse(fs.readFileSync(FILE, 'utf8'));
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
   } catch {
-    data = {};
+    return {};
   }
 }
 
-function save() {
-  fs.mkdirSync(path.dirname(FILE), { recursive: true });
-  const tmp = FILE + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
-  fs.renameSync(tmp, FILE);
+function writeJson(file, obj) {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  const tmp = file + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(obj, null, 2));
+  fs.renameSync(tmp, file);
 }
 
 function player(guildId, userId) {
@@ -36,7 +43,7 @@ function record(guildId, userId, correct, points) {
   } else {
     p.streak = 0;
   }
-  save();
+  writeJson(FILE, data);
 }
 
 function leaderboard(guildId) {
@@ -49,6 +56,30 @@ function get(guildId, userId) {
   return (data[guildId] || {})[userId];
 }
 
-load();
+// Messages already used in a round, so they don't come back.
+function seenSet(guildId) {
+  return new Set(seen[guildId] || []);
+}
 
-module.exports = { record, leaderboard, get };
+function markSeen(guildId, messageId) {
+  const list = (seen[guildId] ??= []);
+  list.push(messageId);
+  if (list.length > SEEN_MAX) list.splice(0, list.length - SEEN_MAX);
+  writeJson(SEEN_FILE, seen);
+}
+
+// Small key/value settings, e.g. the date of the last daily round.
+function getMeta(key) {
+  return meta[key];
+}
+
+function setMeta(key, value) {
+  meta[key] = value;
+  writeJson(META_FILE, meta);
+}
+
+data = readJson(FILE);
+seen = readJson(SEEN_FILE);
+meta = readJson(META_FILE);
+
+module.exports = { record, leaderboard, get, seenSet, markSeen, getMeta, setMeta };
