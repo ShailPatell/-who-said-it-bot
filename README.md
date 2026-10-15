@@ -37,5 +37,5 @@ The bot only works in channels where it has View Channel and Read Message Histor
 
 - Message text is read live from Discord and is not stored. Only scores are saved, in `data/scores.json`.
 - Keep `.env` private. If your token ever leaks, hit **Reset Token** in the portal.
-- To keep it running 24/7, use a cheap host (Railway, Fly.io, a Raspberry Pi) or `pm2` on any machine that stays on.
+- To keep it running 24/7 for free, see [HOSTING.md](HOSTING.md).
 - Quick idea for later: a `/whosaidit daily` that posts one round every day at a set time.
